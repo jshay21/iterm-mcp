@@ -1,6 +1,6 @@
-import { exec } from 'node:child_process';
-import { promisify } from 'node:util';
-import { openSync, closeSync } from 'node:fs';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import { openSync, closeSync } from 'fs';
 import ProcessTracker from './ProcessTracker.js';
 import TtyOutputReader from './TtyOutputReader.js';
 
@@ -18,55 +18,75 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 class CommandExecutor {
   private _execPromise: typeof execPromise;
+  private targetTtyPath: string | null = null;
 
-  constructor(execPromiseOverride?: typeof execPromise) {
-    this._execPromise = execPromiseOverride || execPromise;
+  /**
+   * Creates an instance of CommandExecutor.
+   * @param targetTtyPath Optional. The TTY device path (e.g., /dev/ttys005) of the target iTerm session.
+   *                      If not provided, commands will target the current active iTerm session.
+   */
+  constructor(targetTtyPath?: string) {
+    this.targetTtyPath = targetTtyPath || null;
+    this._execPromise = execPromise;
   }
 
   /**
-   * Executes a command in the iTerm2 terminal.
-   * 
-   * This method handles both single-line and multiline commands by:
-   * 1. Properly escaping the command string for AppleScript
-   * 2. Using different AppleScript approaches based on whether the command contains newlines
-   * 3. Waiting for the command to complete execution
-   * 4. Retrieving the terminal output after command execution
-   * 
+   * Executes a command in the target iTerm2 terminal session.
+   * Handles single-line and multiline commands, waits for completion, and retrieves output.
+   * Uses the target TTY path if provided, otherwise defaults to the current session.
+   *
    * @param command The command to execute (can contain newlines)
    * @returns A promise that resolves to the terminal output after command execution
    */
   async executeCommand(command: string): Promise<string> {
     const escapedCommand = this.escapeForAppleScript(command);
-    
+    const scriptPrefix = this.getAppleScriptTargetPrefix();
+    const scriptSuffix = this.getAppleScriptTargetSuffix();
+
     try {
-      // Check if this is a multiline command (which would have been processed differently)
+      let scriptCommand: string;
       if (command.includes('\n')) {
-        // For multiline text, we use parentheses around our prepared string expression
-        // This allows AppleScript to evaluate the string concatenation expression
-        await this._execPromise(`/usr/bin/osascript -e 'tell application "iTerm2" to tell current session of current window to write text (${escapedCommand})'`);
+        // Multiline: use evaluated expression
+        scriptCommand = `write text (${escapedCommand})`;
       } else {
-        // For single line commands, we can use the standard approach with quoted strings
-        await this._execPromise(`/usr/bin/osascript -e 'tell application "iTerm2" to tell current session of current window to write text "${escapedCommand}"'`);
+        // Single line: use standard quoted string
+        scriptCommand = `write text "${escapedCommand}"`;
       }
-      
-      // Wait until iTerm2 reports that command processing is complete
-      while (await this.isProcessing()) {
+
+      // Construct the full AppleScript
+      // Ensure correct quoting for the -e argument
+      const fullScript = `'${scriptPrefix} to ${scriptCommand}${scriptSuffix}'`;
+      await this._execPromise(`/usr/bin/osascript -e ${fullScript}`);
+
+      // --- Wait for completion ---
+      // isProcessing needs to be updated to use the target TTY as well
+      while (await this.isProcessing()) { // This uses the updated isProcessing
         await sleep(100);
       }
-      
-      // Get the TTY path and check if it's waiting for user input
+
+      // --- Get TTY and wait for input prompt ---
+      // retrieveTtyPath will now return the correct path
       const ttyPath = await this.retrieveTtyPath();
+      // isWaitingForUserInput already uses the correct ttyPath argument
       while (await this.isWaitingForUserInput(ttyPath) === false) {
         await sleep(100);
       }
 
       // Give a small delay for output to settle
       await sleep(200);
-      
+
       // Retrieve the terminal output after command execution
       const afterCommandBuffer = await TtyOutputReader.retrieveBuffer()
       return afterCommandBuffer
     } catch (error: unknown) {
+      // Improve error message if session wasn't found
+      if (error instanceof Error && error.message.includes("Session with TTY")) {
+         throw new Error(`Failed to execute command: ${error.message}`);
+      }
+       // Check for iTerm not running
+      if (error instanceof Error && error.message.includes("Application isn\\'t running")) {
+          throw new Error(`Failed to execute command: iTerm2 application might not be running. Original error: ${error.message}`);
+      }
       throw new Error(`Failed to execute command: ${(error as Error).message}`);
     }
   }
@@ -192,21 +212,129 @@ class CommandExecutor {
       .replace(/\t/g, '\\t');  // Handle tabs
   }
 
+  /**
+   * Retrieves the TTY device path for the target iTerm session.
+   * If a target TTY path was provided to the constructor, it returns that path.
+   * Otherwise, it retrieves the TTY path of the current active iTerm session via AppleScript.
+   * @returns A promise that resolves to the TTY path string.
+   */
   private async retrieveTtyPath(): Promise<string> {
+    // If we have a target TTY, just return it.
+    if (this.targetTtyPath) {
+      // Basic validation
+      if (!this.targetTtyPath.startsWith('/dev/tty')) {
+          console.warn(`Warning: Provided target TTY path "${this.targetTtyPath}" does not look like a valid TTY path (e.g., /dev/ttys001).`);
+      }
+      return this.targetTtyPath;
+    }
+    // Otherwise, get the TTY of the current session (original behavior)
     try {
+      // No need for complex targeting here, just get the current one if no target specified
       const { stdout } = await this._execPromise(`/usr/bin/osascript -e 'tell application "iTerm2" to tell current session of current window to get tty'`);
-      return stdout.trim();
+      const tty = stdout.trim();
+      if (!tty) {
+        throw new Error("Could not retrieve TTY path for the current iTerm session.");
+      }
+      return tty;
     } catch (error: unknown) {
+       // Provide more context in error
+      if (error instanceof Error && error.message.includes("Application isn\\'t running")) {
+          throw new Error(`Failed to retrieve TTY path: iTerm2 application might not be running. Original error: ${error.message}`);
+      }
       throw new Error(`Failed to retrieve TTY path: ${(error as Error).message}`);
     }
   }
 
+  /**
+   * Checks if the target iTerm session is currently processing a command.
+   * Uses the target TTY path if provided, otherwise defaults to the current session.
+   * @returns A promise that resolves to true if processing, false otherwise.
+   */
   private async isProcessing(): Promise<boolean> {
+    const scriptPrefix = this.getAppleScriptTargetPrefix();
+    const scriptSuffix = this.getAppleScriptTargetSuffix();
+    const scriptCommand = 'get is processing';
+    // Ensure correct quoting for the -e argument
+    const fullScript = `'${scriptPrefix} to ${scriptCommand}${scriptSuffix}'`;
+
     try {
-      const { stdout } = await this._execPromise(`/usr/bin/osascript -e 'tell application "iTerm2" to tell current session of current window to get is processing'`);
+      const { stdout } = await this._execPromise(`/usr/bin/osascript -e ${fullScript}`);
       return stdout.trim() === 'true';
     } catch (error: unknown) {
+       // Improve error message if session wasn't found or iTerm not running
+      if (error instanceof Error) {
+          if (error.message.includes("Session with TTY")) {
+             throw new Error(`Failed to check processing status: ${error.message}`);
+          }
+           if (error.message.includes("Application isn\\'t running")) {
+              throw new Error(`Failed to check processing status: iTerm2 application might not be running. Original error: ${error.message}`);
+          }
+      }
       throw new Error(`Failed to check processing status: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * Generates the AppleScript prefix to target the correct iTerm session.
+   * If a targetTtyPath is specified, it finds the session by TTY.
+   * Otherwise, it targets the current session of the current window.
+   * @returns The AppleScript prefix string.
+   */
+  private getAppleScriptTargetPrefix(): string {
+    if (this.targetTtyPath) {
+      // Correctly escape backslashes first, then quotes for AppleScript
+      const escapedTty = this.targetTtyPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      // Note: This AppleScript iterates through all windows and sessions.
+      // It might be slightly less performant than targeting 'current session' directly
+      // if there are many windows/sessions open.
+      // Using 'try...on error...end try' inside AppleScript can sometimes help with stability
+      return `
+tell application "iTerm2"
+	set targetTty to "${escapedTty}"
+	set sessionFound to false
+	repeat with win in windows
+		repeat with sess in sessions of win
+			try
+				if tty of sess is targetTty then
+					set sessionFound to true
+					tell sess -- Found the target session
+`.trim(); // Use trim() to remove leading/trailing whitespace for clean embedding
+    } else {
+      // Fallback to original behavior: target the current session
+      return 'tell application "iTerm2" to tell current session of current window';
+    }
+  }
+
+  /**
+   * Generates the AppleScript suffix corresponding to the prefix from getAppleScriptTargetPrefix.
+   * @returns The AppleScript suffix string.
+   */
+  private getAppleScriptTargetSuffix(): string {
+    if (this.targetTtyPath) {
+      // Close the 'tell sess' and 'tell application' blocks, handle not found case
+      return `
+					end tell -- end tell sess
+					-- Exit loops once action is performed on the target session
+					-- Use 'exit repeat' if performing an action, but for 'get' we might need to let it finish the loop
+					-- For simplicity here, assume we only care about the first match
+					-- If the command was 'write text', we'd want to exit here.
+					-- If it was 'get is processing', maybe not. Let's refine if needed.
+					-- Adding an explicit return for functions like 'get is processing' might be safer
+					return result -- Return the result from the 'get' command
+				end if
+			on error errMsg number errNum
+				-- Ignore errors from sessions that might be closing or invalid
+			end try
+		end repeat
+	end repeat
+	if not sessionFound then
+		error "Session with TTY " & targetTty & " not found."
+	end if
+end tell -- end tell application "iTerm2"
+`.trim(); // Use trim() to remove leading/trailing whitespace
+    } else {
+      // No suffix needed for the simpler 'current session' case
+      return '';
     }
   }
 }
