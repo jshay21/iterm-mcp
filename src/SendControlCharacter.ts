@@ -15,49 +15,6 @@ class SendControlCharacter {
     await execPromise(command);
   }
 
-  // Helper to generate AppleScript prefix/suffix (similar to CommandExecutor)
-  private getAppleScriptTargetPrefix(): string {
-    if (this.targetTtyPath) {
-      // Correctly escape backslashes first, then quotes for AppleScript
-      const escapedTty = this.targetTtyPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-      return `
-tell application "iTerm2"
-	set targetTty to "${escapedTty}"
-	set sessionFound to false
-	repeat with win in windows
-		repeat with sess in sessions of win
-			try
-				if tty of sess is targetTty then
-					set sessionFound to true
-					tell sess -- Found the target session
-`.trim();
-    } else {
-      return 'tell application "iTerm2" to tell current session of current window';
-    }
-  }
-
-  private getAppleScriptTargetSuffix(): string {
-    if (this.targetTtyPath) {
-      return `
-					end tell -- end tell sess
-					-- Exit loop after action
-					return -- Assuming the action was performed
-				end if
-			on error errMsg number errNum
-				-- Ignore errors
-			end try
-		end repeat
-	end repeat
-	if not sessionFound then
-		error "Session with TTY " & targetTty & " not found."
-	end if
-end tell
-`.trim();
-    } else {
-      return '';
-    }
-  }
-
   async send(letter: string): Promise<void> {
     let controlCode: number;
     
@@ -82,22 +39,54 @@ end tell
       controlCode = letter.charCodeAt(0) - 64;
     }
 
-    const scriptPrefix = this.getAppleScriptTargetPrefix();
-    const scriptSuffix = this.getAppleScriptTargetSuffix();
-    // The core command uses the controlCode variable
-    const scriptCommand = `write text (ASCII character ${controlCode})`; 
-    const ascript = `${scriptPrefix} to ${scriptCommand}${scriptSuffix}`;
+    let ascript: string;
+    if (this.targetTtyPath) {
+      // Use the verified and working AppleScript format for targeting a specific session
+      ascript = `
+tell application "iTerm2"
+  set foundSession to false
+  set targetTTY to "${this.targetTtyPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"
+  
+  repeat with aWindow in windows
+    repeat with aTab in tabs of aWindow
+      repeat with aSession in sessions of aTab
+        try
+          set sessionTty to tty of aSession
+          if sessionTty is equal to targetTTY then
+            tell aSession
+              write text (ASCII character ${controlCode})
+            end tell
+            set foundSession to true
+            return
+          end if
+        on error
+          -- Ignore errors and continue
+        end try
+      end repeat
+      if foundSession then exit repeat
+    end repeat
+    if foundSession then exit repeat
+  end repeat
+  
+  if not foundSession then
+    error "Session with TTY " & targetTTY & " not found"
+  end if
+end tell`;
+    } else {
+      // For current session, use the simple approach
+      ascript = `tell application "iTerm2" to tell current session of current window to write text (ASCII character ${controlCode})`;
+    }
 
     try {
       await this.executeCommand(`osascript -e '${ascript}'`);
     } catch (error: unknown) {
       if (error instanceof Error) {
-          if (error.message.includes("Session with TTY")) {
-             throw new Error(`Failed to send control character: ${error.message}`);
-          }
-           if (error.message.includes("Application isn\\'t running")) {
-              throw new Error(`Failed to send control character: iTerm2 application might not be running. Original error: ${error.message}`);
-          }
+        if (error.message.includes("Session with TTY")) {
+          throw new Error(`Failed to send control character: ${error.message}`);
+        }
+        if (error.message.includes("Application isn\\'t running")) {
+          throw new Error(`Failed to send control character: iTerm2 application might not be running. Original error: ${error.message}`);
+        }
       }
       throw new Error(`Failed to send control character: ${(error as Error).message}`);
     }

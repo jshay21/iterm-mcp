@@ -1,0 +1,10 @@
+- [x] Define the MCP server named 'iterm-mcp-new' using the command line.
+  - [x] Modify package.json to change project name and bin key to 'iterm-mcp-new'.
+  - [x] Run pnpm install.
+  - [x] Run pnpm run build.
+  - [x] Determine scope for the MCP server (`user`).
+  - [x] Determine default arguments for the MCP server command (`/dev/ttys004 --log-level debug`).
+  - [x] Provide the user with the `claude mcp add` command.
+- [x] Determine where to install the MCP.
+- [x] Determine how to add the MCP to the configuration.
+- [x] Inform the user about the installation and configuration process. 

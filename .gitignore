@@ -3,3 +3,4 @@ build/
 *.log
 .env*
 tmp
+**/.claude/settings.local.json

@@ -40,8 +40,6 @@ class CommandExecutor {
    */
   async executeCommand(command: string): Promise<string> {
     const escapedCommand = this.escapeForAppleScript(command);
-    const scriptPrefix = this.getAppleScriptTargetPrefix();
-    const scriptSuffix = this.getAppleScriptTargetSuffix();
 
     try {
       let scriptCommand: string;
@@ -54,20 +52,54 @@ class CommandExecutor {
       }
 
       // Construct the full AppleScript
-      // Ensure correct quoting for the -e argument
-      const fullScript = `'${scriptPrefix} to ${scriptCommand}${scriptSuffix}'`;
-      await this._execPromise(`/usr/bin/osascript -e ${fullScript}`);
+      let ascript: string;
+      
+      if (this.targetTtyPath) {
+        // Use the verified and working AppleScript format for targeting a specific session
+        ascript = `
+tell application "iTerm2"
+  set foundSession to false
+  set targetTTY to "${this.targetTtyPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"
+  
+  repeat with aWindow in windows
+    repeat with aTab in tabs of aWindow
+      repeat with aSession in sessions of aTab
+        try
+          set sessionTty to tty of aSession
+          if sessionTty is equal to targetTTY then
+            tell aSession
+              ${scriptCommand}
+            end tell
+            set foundSession to true
+            return "Command sent to " & targetTTY
+          end if
+        on error
+          -- Ignore errors and continue
+        end try
+      end repeat
+      if foundSession then exit repeat
+    end repeat
+    if foundSession then exit repeat
+  end repeat
+  
+  if not foundSession then
+    error "Session with TTY " & targetTTY & " not found"
+  end if
+end tell`;
+      } else {
+        // For current session, use the simple approach
+        ascript = `tell application "iTerm2" to tell current session of current window to ${scriptCommand}`;
+      }
+      
+      await this._execPromise(`/usr/bin/osascript -e '${ascript}'`);
 
       // --- Wait for completion ---
-      // isProcessing needs to be updated to use the target TTY as well
-      while (await this.isProcessing()) { // This uses the updated isProcessing
+      while (await this.isProcessing()) {
         await sleep(100);
       }
 
       // --- Get TTY and wait for input prompt ---
-      // retrieveTtyPath will now return the correct path
       const ttyPath = await this.retrieveTtyPath();
-      // isWaitingForUserInput already uses the correct ttyPath argument
       while (await this.isWaitingForUserInput(ttyPath) === false) {
         await sleep(100);
       }
@@ -76,8 +108,9 @@ class CommandExecutor {
       await sleep(200);
 
       // Retrieve the terminal output after command execution
-      const afterCommandBuffer = await TtyOutputReader.retrieveBuffer()
-      return afterCommandBuffer
+      // Use the target TTY path if available
+      const afterCommandBuffer = await TtyOutputReader.retrieveBuffer(this.targetTtyPath || undefined);
+      return afterCommandBuffer;
     } catch (error: unknown) {
       // Improve error message if session wasn't found
       if (error instanceof Error && error.message.includes("Session with TTY")) {
@@ -251,14 +284,47 @@ class CommandExecutor {
    * @returns A promise that resolves to true if processing, false otherwise.
    */
   private async isProcessing(): Promise<boolean> {
-    const scriptPrefix = this.getAppleScriptTargetPrefix();
-    const scriptSuffix = this.getAppleScriptTargetSuffix();
-    const scriptCommand = 'get is processing';
-    // Ensure correct quoting for the -e argument
-    const fullScript = `'${scriptPrefix} to ${scriptCommand}${scriptSuffix}'`;
+    let ascript: string;
+      
+    if (this.targetTtyPath) {
+      // Use the verified and working AppleScript format for targeting a specific session
+      ascript = `
+tell application "iTerm2"
+  set foundSession to false
+  set targetTTY to "${this.targetTtyPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"
+  
+  repeat with aWindow in windows
+    repeat with aTab in tabs of aWindow
+      repeat with aSession in sessions of aTab
+        try
+          set sessionTty to tty of aSession
+          if sessionTty is equal to targetTTY then
+            tell aSession
+              set isProcessing to is processing
+            end tell
+            set foundSession to true
+            return isProcessing
+          end if
+        on error
+          -- Ignore errors and continue
+        end try
+      end repeat
+      if foundSession then exit repeat
+    end repeat
+    if foundSession then exit repeat
+  end repeat
+  
+  if not foundSession then
+    error "Session with TTY " & targetTTY & " not found"
+  end if
+end tell`;
+    } else {
+      // For current session, use the simple approach
+      ascript = 'tell application "iTerm2" to tell current session of current window to get is processing';
+    }
 
     try {
-      const { stdout } = await this._execPromise(`/usr/bin/osascript -e ${fullScript}`);
+      const { stdout } = await this._execPromise(`/usr/bin/osascript -e '${ascript}'`);
       return stdout.trim() === 'true';
     } catch (error: unknown) {
        // Improve error message if session wasn't found or iTerm not running
@@ -271,70 +337,6 @@ class CommandExecutor {
           }
       }
       throw new Error(`Failed to check processing status: ${(error as Error).message}`);
-    }
-  }
-
-  /**
-   * Generates the AppleScript prefix to target the correct iTerm session.
-   * If a targetTtyPath is specified, it finds the session by TTY.
-   * Otherwise, it targets the current session of the current window.
-   * @returns The AppleScript prefix string.
-   */
-  private getAppleScriptTargetPrefix(): string {
-    if (this.targetTtyPath) {
-      // Correctly escape backslashes first, then quotes for AppleScript
-      const escapedTty = this.targetTtyPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-      // Note: This AppleScript iterates through all windows and sessions.
-      // It might be slightly less performant than targeting 'current session' directly
-      // if there are many windows/sessions open.
-      // Using 'try...on error...end try' inside AppleScript can sometimes help with stability
-      return `
-tell application "iTerm2"
-	set targetTty to "${escapedTty}"
-	set sessionFound to false
-	repeat with win in windows
-		repeat with sess in sessions of win
-			try
-				if tty of sess is targetTty then
-					set sessionFound to true
-					tell sess -- Found the target session
-`.trim(); // Use trim() to remove leading/trailing whitespace for clean embedding
-    } else {
-      // Fallback to original behavior: target the current session
-      return 'tell application "iTerm2" to tell current session of current window';
-    }
-  }
-
-  /**
-   * Generates the AppleScript suffix corresponding to the prefix from getAppleScriptTargetPrefix.
-   * @returns The AppleScript suffix string.
-   */
-  private getAppleScriptTargetSuffix(): string {
-    if (this.targetTtyPath) {
-      // Close the 'tell sess' and 'tell application' blocks, handle not found case
-      return `
-					end tell -- end tell sess
-					-- Exit loops once action is performed on the target session
-					-- Use 'exit repeat' if performing an action, but for 'get' we might need to let it finish the loop
-					-- For simplicity here, assume we only care about the first match
-					-- If the command was 'write text', we'd want to exit here.
-					-- If it was 'get is processing', maybe not. Let's refine if needed.
-					-- Adding an explicit return for functions like 'get is processing' might be safer
-					return result -- Return the result from the 'get' command
-				end if
-			on error errMsg number errNum
-				-- Ignore errors from sessions that might be closing or invalid
-			end try
-		end repeat
-	end repeat
-	if not sessionFound then
-		error "Session with TTY " & targetTty & " not found."
-	end if
-end tell -- end tell application "iTerm2"
-`.trim(); // Use trim() to remove leading/trailing whitespace
-    } else {
-      // No suffix needed for the simpler 'current session' case
-      return '';
     }
   }
 }
