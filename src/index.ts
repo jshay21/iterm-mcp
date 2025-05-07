@@ -38,7 +38,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             ttyPath: {
               type: "string",
-              description: "Optional: The TTY device path (e.g., /dev/ttys005) to target a specific iTerm session.",
+              description: "Optional: The TTY device path to target a specific iTerm session. Defaults to /dev/ttys001 if not specified.",
+            },
+            filterBase64: {
+              type: "boolean",
+              description: "Whether to filter out base64-encoded content like IMGCAT images. Defaults to true.",
             },
           },
           required: ["command"],
@@ -56,7 +60,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             ttyPath: {
               type: "string",
-              description: "Optional: The TTY device path (e.g., /dev/ttys005) to target a specific iTerm session.",
+              description: "Optional: The TTY device path to target a specific iTerm session. Defaults to /dev/ttys001 if not specified.",
+            },
+            filterBase64: {
+              type: "boolean",
+              description: "Whether to filter out base64-encoded content like IMGCAT images. Defaults to true.",
             },
           },
           required: ["linesOfOutput"],
@@ -74,7 +82,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             ttyPath: {
               type: "string",
-              description: "Optional: The TTY device path (e.g., /dev/ttys005) to target a specific iTerm session.",
+              description: "Optional: The TTY device path to target a specific iTerm session. Defaults to /dev/ttys001 if not specified.",
             },
           },
           required: ["letter"],
@@ -85,18 +93,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest) => {
-  const ttyPath = request.params.arguments?.ttyPath ? String(request.params.arguments.ttyPath) : undefined;
+  // Default to /dev/ttys001 if no TTY path is specified
+  const ttyPath = request.params.arguments?.ttyPath ? String(request.params.arguments.ttyPath) : "/dev/ttys001";
 
   switch (request.params.name) {
     case "write_to_terminal": {
       let executor = new CommandExecutor(ttyPath);
       const command = String(request.params.arguments?.command);
+      const filterBase64 = request.params.arguments?.filterBase64 !== false; // Default to true if not specified
+      
+      // Get initial buffer state
       const beforeCommandBuffer = await TtyOutputReader.retrieveBuffer(ttyPath);
       const beforeCommandBufferLines = beforeCommandBuffer.split("\n").length;
 
+      // Execute the command
       await executor.executeCommand(command);
 
-      const afterCommandBuffer = await TtyOutputReader.retrieveBuffer(ttyPath);
+      // Get updated buffer state
+      const rawAfterCommandBuffer = await TtyOutputReader.retrieveBuffer(ttyPath);
+      // Filter base64 content if needed
+      const afterCommandBuffer = filterBase64 
+        ? TtyOutputReader.filterBase64Content(rawAfterCommandBuffer) 
+        : rawAfterCommandBuffer;
+      
       const afterCommandBufferLines = afterCommandBuffer.split("\n").length;
       const outputLines = Math.max(0, afterCommandBufferLines - beforeCommandBufferLines);
 
@@ -111,7 +130,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
     }
     case "read_terminal_output": {
       const linesOfOutput = Number(request.params.arguments?.linesOfOutput) || 25;
-      const output = await TtyOutputReader.call(linesOfOutput, ttyPath);
+      const filterBase64 = request.params.arguments?.filterBase64 !== false; // Default to true if not specified
+      const output = await TtyOutputReader.call(linesOfOutput, ttyPath, filterBase64);
 
       return {
         content: [

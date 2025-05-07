@@ -4,13 +4,43 @@ import { promisify } from 'util';
 const execPromise = promisify(exec);
 
 export default class TtyOutputReader {
-  static async call(linesOfOutput?: number, ttyPath?: string) {
+  static async call(linesOfOutput?: number, ttyPath?: string, filterBase64: boolean = true) {
     const buffer = await this.retrieveBuffer(ttyPath);
-    if (!linesOfOutput) {
-      return buffer;
+    let processedBuffer = buffer;
+    
+    // Filter out base64 blobs if requested
+    if (filterBase64) {
+      // Filter out IMGCAT and similar base64 content
+      processedBuffer = this.filterBase64Content(buffer);
     }
-    const lines = buffer.split('\n');
+    
+    if (!linesOfOutput) {
+      return processedBuffer;
+    }
+    
+    const lines = processedBuffer.split('\n');
     return lines.slice(-linesOfOutput - 1).join('\n');
+  }
+  
+  /**
+   * Filters out base64-encoded content (like IMGCAT output) from terminal output
+   * @param content Terminal output text
+   * @returns Filtered content with base64 blobs replaced by placeholders
+   */
+  static filterBase64Content(content: string): string {
+    // Base64 pattern: continuous string of A-Z, a-z, 0-9, +, /, and = at the end
+    const base64Pattern = /[A-Za-z0-9+/]{100,}={0,2}/g;
+    
+    // IMGCAT specific patterns
+    const imgcatPrefixPattern = /\x1b\]1337;File=([^:]+)(:[^\n]+)?\n/g;
+    
+    // Replace base64 content with a placeholder
+    let filteredContent = content.replace(base64Pattern, '[BASE64_IMAGE_CONTENT_FILTERED]');
+    
+    // Also handle IMGCAT specific control sequences
+    filteredContent = filteredContent.replace(imgcatPrefixPattern, '[IMGCAT_PREFIX_FILTERED]\n');
+    
+    return filteredContent;
   }
 
   static async retrieveBuffer(ttyPath?: string): Promise<string> {
